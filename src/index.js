@@ -8,17 +8,22 @@ import config from "./config/config.js";
 
 class TextToVideo {
   constructor() {
-    this.createOutputDirectories();
+    // Remove auto-creation of directories in constructor
   }
 
   /**
    * Create necessary output directories
+   * @param {string} baseDir - Base directory for output
    */
-  createOutputDirectories() {
+  createOutputDirectories(baseDir) {
+    if (!baseDir) {
+      throw new Error("Output directory must be specified");
+    }
+
     const directories = [
-      config.tts.outputDir,
-      config.video.outputDir,
-      config.subtitles.outputDir,
+      path.join(baseDir, "audio"),
+      path.join(baseDir, "video"),
+      path.join(baseDir, "subtitles"),
     ];
 
     directories.forEach((dir) => {
@@ -26,6 +31,30 @@ class TextToVideo {
         fs.mkdirSync(dir, { recursive: true });
       }
     });
+
+    return baseDir;
+  }
+
+  /**
+   * Save metadata about the conversion process
+   * @param {string} outputDir - Base output directory
+   * @param {string} text - Original text
+   * @param {Object} metadata - Additional metadata
+   */
+  saveMetadata(outputDir, text, metadata = {}) {
+    const metadataFile = path.join(outputDir, "metadata.json");
+    const textFile = path.join(outputDir, "text.txt");
+
+    // Save original text
+    fs.writeFileSync(textFile, text);
+
+    // Save metadata using the same timestamp from the output directory
+    const timestamp = path.basename(outputDir);
+    const fullMetadata = {
+      timestamp,
+      ...metadata,
+    };
+    fs.writeFileSync(metadataFile, JSON.stringify(fullMetadata, null, 2));
   }
 
   /**
@@ -35,33 +64,8 @@ class TextToVideo {
    * @returns {Promise<string>} - Path to the combined audio file
    */
   async combineAudioSegments(audioSegments, outputFile) {
-    return new Promise((resolve, reject) => {
-      const command = ffmpeg();
-
-      // Add all audio segments as inputs
-      audioSegments.forEach((segment) => {
-        command.input(segment.audioFile);
-      });
-
-      // Create the filter complex string for concatenation
-      const filterComplex =
-        audioSegments.map((_, index) => `[${index}:a]`).join("") +
-        `concat=n=${audioSegments.length}:v=0:a=1[outa]`;
-
-      command
-        .complexFilter(filterComplex)
-        .outputOptions("-map [outa]")
-        .output(outputFile)
-        .on("end", () => {
-          console.log(`Audio segments combined successfully: ${outputFile}`);
-          resolve(outputFile);
-        })
-        .on("error", (err) => {
-          console.error(`Error combining audio segments: ${err.message}`);
-          reject(err);
-        })
-        .run();
-    });
+    const audioFiles = audioSegments.map((segment) => segment.audioFile);
+    return videoService.combineAudioFiles(audioFiles, outputFile);
   }
 
   /**
@@ -87,29 +91,34 @@ class TextToVideo {
    * @param {string} text - The text to convert
    * @param {string} imagePattern - Pattern for image sequence (e.g., 'slide%d.jpg')
    * @param {Object} options - Additional options
-   * @returns {Promise<string>} - Path to the generated video
+   * @param {string} options.outputDir - Custom output directory (optional)
+   * @returns {Promise<{videoPath: string, outputDir: string}>} - Path to the generated video and output directory
    */
   async convert(text, imagePattern, options = {}) {
     try {
+      const startTime = Date.now();
+      const outputDir = this.createOutputDirectories(options.outputDir);
+
       // Split text into segments
       const segments = this.splitText(text);
 
       // Generate audio for each segment
       const audioSegments = await ttsService.generateAudioWithTiming(
         segments,
-        config.tts.outputDir
+        path.join(outputDir, "audio")
       );
 
       // Get actual durations for each audio segment
       for (let i = 0; i < audioSegments.length; i++) {
-        audioSegments[i].duration = await this.getAudioDuration(
+        audioSegments[i].duration = await ttsService.getAudioDuration(
           audioSegments[i].audioFile
         );
       }
 
       // Combine audio segments
       const combinedAudioFile = path.join(
-        config.tts.outputDir,
+        outputDir,
+        "audio",
         "combined_audio.wav"
       );
       await this.combineAudioSegments(audioSegments, combinedAudioFile);
@@ -127,11 +136,11 @@ class TextToVideo {
       });
 
       // Generate SRT file
-      const srtFile = path.join(config.subtitles.outputDir, "subtitles.srt");
+      const srtFile = path.join(outputDir, "subtitles", "subtitles.srt");
       await subtitleService.generateSRT(subtitleSegments, srtFile);
 
       // Generate video
-      const outputVideo = path.join(config.video.outputDir, "output.mp4");
+      const outputVideo = path.join(outputDir, "video", "output.mp4");
       await videoService.generateVideo(
         imagePattern,
         combinedAudioFile,
@@ -139,7 +148,19 @@ class TextToVideo {
         outputVideo
       );
 
-      return outputVideo;
+      // Save metadata
+      const endTime = Date.now();
+      this.saveMetadata(outputDir, text, {
+        processingTime: endTime - startTime,
+        audioDuration: currentTime,
+        segmentCount: segments.length,
+        imagePattern,
+      });
+
+      return {
+        videoPath: outputVideo,
+        outputDir: outputDir,
+      };
     } catch (error) {
       console.error("Error in text-to-video conversion:", error);
       throw error;
@@ -152,11 +173,66 @@ class TextToVideo {
    * @returns {Array<{text: string, duration: number}>} - Array of text segments
    */
   splitText(text) {
-    // Basic implementation - split by sentences
-    const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
-    return sentences.map((sentence) => ({
-      text: sentence.trim(),
-      duration: 5000, // Default 5 seconds per segment
+    // Clean and normalize the text first
+    const cleanText = text
+      .replace(/[\r\n]+/g, " ") // Replace newlines with spaces
+      .replace(/\s+/g, " ") // Normalize spaces
+      .replace(/["'"]/g, '"') // Normalize quotes
+      .trim();
+
+    // Split by sentences but ensure minimum length
+    const sentences = cleanText.match(/[^.!?]+[.!?]+/g) || [cleanText];
+    const segments = [];
+    let currentSegment = "";
+
+    for (let i = 0; i < sentences.length; i++) {
+      const sentence = sentences[i].trim();
+
+      // Skip empty sentences
+      if (!sentence) continue;
+
+      // If current segment is empty, start with this sentence
+      if (!currentSegment) {
+        currentSegment = sentence;
+      } else {
+        // If adding this sentence would make the segment too long, save current segment and start new one
+        if ((currentSegment + " " + sentence).length > 200) {
+          segments.push({
+            text: currentSegment,
+            duration: 5000,
+          });
+          currentSegment = sentence;
+        } else {
+          // Add sentence to current segment
+          currentSegment += " " + sentence;
+        }
+      }
+    }
+
+    // Add the last segment if there is one and it's not too short
+    if (currentSegment && currentSegment.length >= 20) {
+      // Increased minimum length
+      segments.push({
+        text: currentSegment,
+        duration: 5000,
+      });
+    } else if (currentSegment) {
+      // If the last segment is too short, append it to the last segment if possible
+      if (segments.length > 0) {
+        segments[segments.length - 1].text += " " + currentSegment;
+      } else {
+        // If this is the only segment and it's too short, pad it
+        segments.push({
+          text: currentSegment + ". This is the end of the segment.",
+          duration: 5000,
+        });
+      }
+    }
+
+    // Final validation of segments
+    return segments.map((segment) => ({
+      ...segment,
+      text: segment.text.trim().replace(/\s+/g, " "), // Final cleanup of each segment
     }));
   }
 }
